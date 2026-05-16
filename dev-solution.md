@@ -174,6 +174,88 @@
 
 ## Модель данных
 
+В основе сервиса бронирования лежит управление состояниями мест и заказов. Ключевое требование — предотвращение double-booking (oversell) при высоком конкурентном доступе. Для этого используется комбинация реляционной БД для гарантий ACID и in-memory кэша/хранилища для высоконагруженного чтения доступности.
+
+### Основные сущности (Схема БД)
+
+```mermaid
+erDiagram
+    direction LR
+
+    USER {
+        uuid id PK
+    }
+    
+    EVENT {
+        uuid id PK
+        string name
+        timestamp event_date
+        uuid venue_id FK
+    }
+    
+    VENUE {
+        uuid id PK
+        json address
+        json layout
+    }
+    
+    SEAT {
+        uuid id PK
+        uuid event_id FK
+        string seat_number
+        string section
+        decimal price
+        int status
+    }
+    
+    BOOKING {
+        uuid id PK
+        uuid user_id FK
+        uuid event_id FK
+        int status
+        timestamp expires_at
+        timestamp created_at
+    }
+    
+    BOOKING_SEAT {
+        uuid booking_id FK
+        uuid seat_id FK
+    }
+    
+    ORDER {
+        uuid id PK
+        uuid booking_id FK
+        uuid user_id FK
+        int order_status
+        decimal total_amount
+        timestamp created_at
+    }
+    
+    EVENT ||--o{ SEAT : "has"
+    EVENT ||--o{ BOOKING : "has"
+    USER ||--o{ BOOKING : "has"
+    USER ||--o{ ORDER : "has"
+    VENUE ||--|| EVENT : "defines layout for"
+    BOOKING ||--|{ BOOKING_SEAT : "contains"
+    SEAT ||--o{ BOOKING_SEAT : "reserved_in"
+    BOOKING ||--|| ORDER : "may_complete_to"
+```
+
+### Описание сущностей
+
+1. **`EVENT`**: Хранит информацию о мероприятии (название, дата, время). Используется в сценариях просмотра списка мероприятий и деталей схемы зала.
+
+2. **`VENUE`**: Содержит адрес площадки и схему зала (`layout`) в формате JSON. Определяет физическую структуру мест, которые затем копируются в `SEAT` для каждого мероприятия.
+
+3. **`SEAT`**: Представляет конкретное место на конкретное мероприятие. Содержит номер, секцию, цену и статус (`free` → `reserved` → `sold`). Статус изменяется при бронировании, подтверждении покупки, отмене или таймауте.
+
+4. **`BOOKING`**: Фиксирует временное резервирование мест за пользователем. Содержит статус (`active`, `expired`, `cancelled`, `confirmed`) и `expires_at` для автоматического освобождения по таймауту. Создаётся при выборе мест, завершается подтверждением покупки или отменой.
+
+5. **`BOOKING_SEAT`**: Связывает бронь с конкретными местами. Позволяет одной брони включать несколько мест (например, 5 билетов для группы друзей).
+
+6. **`ORDER`**: Создаётся после успешного подтверждения покупки. Хранит итоговую сумму и статус заказа (`paid`, `refunded`, `failed`). Используется в сценариях просмотра истории заказов и возврата билетов.
+
+7. **`USER`**: Хранит идентификатор пользователя для привязки броней и заказов. Используется во всех сценариях, где требуется авторизация.
 ---
 
 ##  Архитектура системы
