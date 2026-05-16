@@ -287,6 +287,114 @@ erDiagram
 
 ##  Архитектура системы
 
+Архитектура построена на микросервисах с разделением путей чтения и записи (CQRS) и использованием Redis для распределённых блокировок с TTL. Ключевые требования: выдерживать 10 000 RPS на чтение доступности и 1 000 операций бронирования в секунду в пике.
+
+### Основные компоненты
+
+1. **API Gateway** — входная точка для клиентов. Обеспечивает аутентификацию, rate limiting (защита от DDoS) и роутинг запросов к соответствующим сервисам.
+
+2. **Event Service** — сервис для работы с мероприятиями. Отдаёт список мероприятий, детальную информацию и схему зала. Работает в режиме только чтения, данные кэшируются в CDN или Redis.
+
+3. **Availability Service** — сервис доступности мест. Обрабатывает до 10 000 RPS запросов на чтение схемы зала со статусами мест. Читает данные из Redis-реплик, не нагружая основную БД.
+
+4. **Booking Service** — основной сервис для бронирования и подтверждения покупки. Управляет распределёнными блокировками в Redis, создаёт брони и заказы в PostgreSQL, взаимодействует с платёжным шлюзом.
+
+5. **Payment Adapter** — интеграционный сервис для работы с внешним платёжным провайдером. Принимает вебхуки, нормализует их и отправляет в очередь для обработки.
+
+6. **Order History Service** — сервис истории заказов (CQRS read-модель). Отдаёт пользователю список его заказов и детали, разгружая основную пишущую БД.
+
+7. **PostgreSQL Cluster** — основное хранилище данных с ACID-гарантиями. Хранит события (`EVENT`), места (`SEAT`), брони (`BOOKING`) и заказы (`ORDER`).
+
+8. **Redis Cluster** — используется для двух целей:
+   - **Распределённые блокировки** (TTL) — временное резервирование мест
+   - **Кэш доступности** — схема зала со статусами мест для высоконагруженного чтения
+
+9. **Message Broker (Kafka / RabbitMQ)** — обеспечивает асинхронную доставку событий: от `Booking Service` в `Order History Service` и `Notification Service`.
+
+10. **Notification Service** — отправляет пользователю подтверждения по email/SMS/push (асинхронно, не блокирует основной поток).
+
+### Архитектурная схема
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "22px"}}}%%
+graph LR
+  subgraph Client
+    UserApp[Клиентское приложение]
+  end
+  
+  subgraph Gateway
+    APIGateway[API Gateway & Rate Limiter]
+  end
+  
+  subgraph Core Services
+    EventService[Event Service]
+    AvailabilityService[Availability Service]
+    BookingService[Booking Service]
+    PaymentAdapter[Payment Adapter]
+    OrderHistoryService[Order History Service]
+    NotificationService[Notification Service]
+  end
+  
+  subgraph Caching & Queues
+    RedisCache[(Redis Cluster<br/>Cache + Locks)]
+    Broker[[Message Broker<br/>Kafka / RabbitMQ]]
+  end
+
+  subgraph Persistence
+    PostgresDB[(PostgreSQL Cluster<br/>Events, Seats, Bookings, Orders)]
+  end
+  
+  subgraph External
+    PaymentProvider[Платёжный провайдер]
+  end
+
+  UserApp -->|HTTP| APIGateway
+  APIGateway -->|GET /events| EventService
+  APIGateway -->|GET /events/id/seats| AvailabilityService
+  APIGateway -->|POST /bookings| BookingService
+  APIGateway -->|GET /orders| OrderHistoryService
+  
+  EventService -->|Read| PostgresDB
+  AvailabilityService -->|Read| RedisCache
+  
+  BookingService -->|SET NX EX locks| RedisCache
+  BookingService -->|DEL locks| RedisCache
+  BookingService -->|Write| PostgresDB
+  BookingService -->|Publish events| Broker
+  BookingService -->|Initiate payment| PaymentProvider
+  
+  PaymentAdapter -->|Webhook| PaymentProvider
+  PaymentAdapter -->|Publish payment result| Broker
+  
+  Broker -->|Consume| OrderHistoryService
+  Broker -->|Consume| NotificationService
+  
+  OrderHistoryService -->|Read| PostgresDB
+  NotificationService -->|Send email/SMS| UserApp
+```
+
+### Паттерны и подходы
+
+#### Распределённая блокировка Redis (SET NX EX)
+
+Для предотвращения двойного бронирования одного места несколькими пользователями используется паттерн **Распределённая блокировка** на основе Redis. `Booking Service` при выборе мест выполняет атомарную команду `SET key seat_id NX EX ttl`, где `key` имеет формат `seat:lock:{event_id}:{seat_id}`, а значение — `user_id`. Команда атомарна: только один клиент успешно устанавливает ключ для каждого места. TTL (например, 600 секунд) автоматически определяет срок действия блокировки. Это даёт гарантию, что два пользователя не могут одновременно забронировать одно место, и не требует постоянного опроса БД для обработки таймаутов.
+
+#### Сага с компенсацией (Saga)
+
+При сбое в процессе подтверждения покупки (например, платёжный шлюз вернул ошибку после успешной блокировки мест) используется паттерн **Сага с компенсацией**. `Booking Service` выполняет серию шагов: блокировка мест в Redis, создание брони в БД, вызов платёжного шлюза. Если любой шаг завершается ошибкой, запускаются компенсирующие действия: снятие блокировки из Redis и перевод брони в статус `expired` или `cancelled`. Это гарантирует, что система не оставляет места в заблокированном состоянии при неудачной оплате.
+
+#### Transactional Outbox (атомарная запись + публикация)
+
+Для надёжной пересылки событий (например, `order.confirmed`) в Message Broker используется паттерн **Transactional Outbox**. `Booking Service` в рамках одной атомарной транзакции PostgreSQL обновляет статусы мест, создаёт заказ (`ORDER`) и пишет событие в таблицу `outbox_events`. Затем фоновый процесс (CDC типа Debezium или простой poller) вычитывает новые записи и публикует их в Kafka/RabbitMQ. Это даёт гарантию **At-least-once** доставки и защищает от потери событий при сбоях между БД и брокером.
+
+#### CQRS (Command Query Responsibility Segregation)
+
+Для разделения высоконагруженного чтения и конкурентной записи используется паттерн **CQRS**. `Availability Service` отвечает за чтение доступности мест (до 10 000 RPS) и читает данные из Redis Cache, который обновляется асинхронно. `Booking Service` отвечает за запись (бронирование, подтверждение) и работает напрямую с PostgreSQL. Это позволяет независимо масштабировать компоненты чтения и записи, а также оптимизировать хранение под разные паттерны доступа.
+
+####  Интеграционные события (Event-Driven)
+
+Для асинхронной коммуникации между сервисами (например, уведомления пользователя после подтверждения заказа) используется паттерн **Интеграционные события**. `Booking Service` после успешного создания заказа публикует событие `order.confirmed` в Message Broker, не дожидаясь обработки. `Notification Service` и `Order History Service` подписываются на это событие и обрабатывают его асинхронно. Это устраняет тесную связь между сервисами и повышает отказоустойчивость — при временной недоступности Notification Service заказы всё равно создаются.
+
 ---
 
 ## Технические сценарии
