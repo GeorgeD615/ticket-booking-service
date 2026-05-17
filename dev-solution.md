@@ -174,7 +174,7 @@
 
 ## Модель данных (Data Model)
 
-В основе сервиса бронирования лежит управление состояниями мест и заказов. Ключевое требование — предотвращение double-booking (oversell) при высоком конкурентном доступе. Для этого используется комбинация реляционной БД (PostgreSQL) для гарантий ACID и Redis для распределённых блокировок с автоматическим TTL.
+В основе сервиса бронирования лежит управление состояниями мест и заказов. Ключевое требование — предотвращение double-booking (oversell) при высоком конкурентном доступе. Для этого используется комбинация реляционной БД (PostgreSQL) для гарантий ACID и Redis для распределённых блокировок с автоматическим TTL и кэширования доступности мест.
 
 ### Основные сущности (Схема БД)
 
@@ -188,24 +188,24 @@ erDiagram
     
     EVENT {
         uuid id PK
+        uuid venue_id FK
         string name
         timestamp event_date
-        uuid venue_id FK
     }
     
     VENUE {
         uuid id PK
+        string name
         json address
         json layout
     }
     
     SEAT {
         uuid id PK
-        uuid event_id FK
-        string seat_number
+        uuid venue_id FK
         string section
-        decimal price
-        int status
+        string row_number
+        string seat_number
     }
     
     BOOKING {
@@ -213,12 +213,17 @@ erDiagram
         uuid user_id FK
         uuid event_id FK
         int status
+        decimal total_amount
         timestamp created_at
+        timestamp expires_at
     }
     
-    BOOKING_SEAT {
+    EVENT_SEAT {
+        uuid id PK
         uuid booking_id FK
         uuid seat_id FK
+        int status
+        decimal price
     }
     
     ORDER {
@@ -231,14 +236,14 @@ erDiagram
         timestamp created_at
     }
     
-    EVENT ||--o{ SEAT : "has"
     EVENT ||--o{ BOOKING : "has"
     USER ||--o{ BOOKING : "has"
     USER ||--o{ ORDER : "has"
-    VENUE ||--|| EVENT : "defines layout for"
-    BOOKING ||--|{ BOOKING_SEAT : "contains"
-    SEAT ||--o{ BOOKING_SEAT : "reserved_in"
+    VENUE ||--o{ SEAT : "has"
+    VENUE ||--|| EVENT : "has"
+    BOOKING ||--|{ EVENT_SEAT : "has"
     BOOKING ||--|| ORDER : "may_complete_to"
+    SEAT ||--o{ EVENT_SEAT : "reserved_in"
 ```
 
 ### Описание сущностей
@@ -257,107 +262,139 @@ erDiagram
 
 7. **`USER`**: Хранит идентификатор пользователя для привязки броней и заказов.
 
-### Redis для временного резервирования (блокировки с TTL)
+### Распределённая блокировка Redis (TTL)
 
-Временная блокировка мест вынесена из PostgreSQL в Redis. Это позволяет:
-- Автоматически освобождать места по таймауту без фоновых процессов
-- Получать и снимать блокировки с высокой скоростью (in-memory)
-- Избежать состояния гонки благодаря атомарной операции Redis
+Для предотвращения двойного бронирования одного места используется **Redis с атомарной операцией SET NX EX**.
 
-**Схема работы с Redis:**
+*   **Механизм блокировки**: При выборе места выполняется `SET seat:lock:{event_id}:{seat_id} user_id NX EX 600`. Ключ устанавливается только если отсутствует (NX) и автоматически истекает через 600 секунд (EX). Значение — идентификатор пользователя.
 
-| Операция | Действие |
-|----------|----------|
-| **Бронирование мест** | Выполняется атомарная `SET key seat_id NX EX ttl`. Значение — `user_id`. Только один клиент успешно устанавливает ключ для каждого места. |
-| **Подтверждение покупки** | Перед обновлением БД проверяется, что ключ в Redis принадлежит этому пользователю. После успешного обновления БД ключ удаляется (`DEL`). |
-| **Таймаут** | Redis автоматически удаляет ключ по истечении TTL. Место становится доступным без участия приложения. |
-| **Отмена брони** | Ключ удаляется из Redis вручную, места освобождаются мгновенно. |
+*   **Снятие блокировки**: При успешной оплате `Booking Service` выполняет `DEL`. При отмене пользователем — `DEL`. При истечении TTL — Redis удаляет ключ автоматически, освобождая место без фоновых процессов.
+
+*   **Бронирование нескольких мест**: Блокировки получаются последовательно для каждого места. Если хотя бы одна не удалась — все уже полученные освобождаются (`DEL`), операция полностью отменяется.
+
+### Кэширование доступности мест (Redis Bitmap)
+
+Для достижения 10 000 RPS на чтение доступности мест используется **Redis с Bitmap**.
+
+*   **Структура хранения**: Ключ `event:availability:{event_id}` содержит Bitmap, где каждый бит соответствует одному месту. Значение `1` — свободно, `0` — продано/забронировано. Размер для 50 000 мест — 6.25 KB.
+
+*   **Стратегия чтения**: `Availability Service` при запросе схемы зала выполняет `GET` из Redis Replica. При промахе кэша — загружает статусы из PostgreSQL и записывает в Redis. Это полностью разгружает БД в пик чтения.
+
+*   **Стратегия обновления**: `Booking Service` при успешном бронировании/продаже выполняет `SETBIT` в Redis Master, меняя бит с 1 на 0. Изменения синхронно реплицируются на Redis Replica.
+
+*   **Консистентность**: Допускается асинхронная задержка между мастером и репликой (eventual consistency). В худшем случае пользователь увидит место свободным на 1-2 секунды дольше, но двойная продажа исключена блокировкой.
 
 
 ### Идемпотентность (Idempotency)
 
-Для корректной обработки повторных запросов используется механизм идемпотентности.
+Для защиты от двойного списания при повторных запросах используется **уникальный ключ идемпотентности**.
 
-**Реализация:**
-- Клиент генерирует уникальный `idempotency_key` (например, UUID v4 или `user_id:request_timestamp`)
-- Ключ передаётся в запросе на подтверждение покупки
-- В таблице `ORDER` создаётся уникальное ограничение по полю `idempotency_key`
+*   **Генерация ключа**: Клиент генерирует `idempotency_key` (UUID v4 или `user_id:request_timestamp`) и передаёт его в запросе на подтверждение покупки.
+
+*   **Уникальное ограничение**: В таблице `ORDER` создаётся уникальный индекс по полю `idempotency_key`. При попытке повторной вставки с тем же ключом БД вернёт ошибку дубликата.
+
+*   **Логика обработки**: При первом запросе создаётся заказ. При повторном — система возвращает ранее созданный заказ (без повторной оплаты и обновления статусов мест).
 
 ---
 
-## Архитектура системы
+# Архитектура системы
 
-Архитектура построена на микросервисах с использованием Redis для распределённых блокировок с TTL. Ключевые требования: выдерживать 10 000 RPS на чтение доступности и 1 000 операций бронирования в секунду в пике.
+Архитектура построена на микросервисах с использованием Redis для распределённых блокировок с TTL и кэширования доступности. Ключевые требования: выдерживать 10 000 RPS на чтение доступности и 1 000 операций бронирования в секунду в пике.
 
 ### Основные компоненты
 
-1. **API Gateway** — входная точка для клиентов. Обеспечивает аутентификацию, rate limiting (защита от DDoS) и роутинг запросов к соответствующим сервисам.
+1. **Load Balancer** — балансировщик нагрузки (Nginx / HAProxy / AWS ALB). Распределяет входящий трафик между экземплярами API Gateway. Обеспечивает health checks и отказоустойчивость.
 
-2. **Event Service** — сервис для работы с мероприятиями. Отдаёт список мероприятий, детальную информацию и схему зала. Работает в режиме только чтения.
+2. **API Gateway** — горизонтально масштабируемый компонент (3+ экземпляров). Обеспечивает аутентификацию, rate limiting (защита от DDoS) и роутинг запросов к соответствующим сервисам. Масштабируется под нагрузку за счёт добавления новых экземпляров.
 
-3. **Availability Service** — сервис доступности мест. Обрабатывает до 10 000 RPS запросов на чтение схемы зала со статусами мест. Читает данные из PostgreSQL, используя индексы и кэширование на уровне БД.
+3. **Event Service** — сервис для работы с мероприятиями. Отдаёт список мероприятий, детальную информацию и схему зала. Работает в режиме только чтения.
 
-4. **Booking Service** — основной сервис для бронирования и подтверждения покупки. Управляет распределёнными блокировками в Redis, создаёт брони и заказы в PostgreSQL, взаимодействует с платёжным шлюзом.
+4. **Availability Service** — сервис доступности мест. Обрабатывает до 10 000 RPS запросов на чтение схемы зала со статусами мест. Читает данные из Redis Cache (Bitmap), не нагружая PostgreSQL.
 
-5. **Payment Adapter** — интеграционный сервис для работы с внешним платёжным провайдером. Принимает вебхуки, нормализует их и передаёт в Booking Service.
+5. **Booking Service** — основной сервис для бронирования и подтверждения покупки. Управляет распределёнными блокировками в Redis, обновляет кэш доступности, создаёт брони и заказы в PostgreSQL, взаимодействует с платёжным шлюзом.
 
-6. **Order History Service** — сервис истории заказов. Отдаёт пользователю список его заказов и детали.
+6. **Payment Adapter** — интеграционный сервис для работы с внешним платёжным провайдером. Принимает вебхуки, нормализует их и передаёт в Booking Service.
 
-7. **PostgreSQL Cluster** — основное хранилище данных с ACID-гарантиями. Хранит события (`EVENT`), места (`SEAT`), брони (`BOOKING`) и заказы (`ORDER`).
+7. **Order History Service** — сервис истории заказов. Отдаёт пользователю список его заказов и детали.
 
-8. **Redis Cluster** — используется для распределённых блокировок с TTL при временном резервировании мест.
+8. **PostgreSQL Cluster** — основное хранилище данных с ACID-гарантиями. Хранит события (`EVENT`), места (`SEAT`), брони (`BOOKING`) и заказы (`ORDER`).
+
+9. **Redis Cluster** — используется для трёх целей:
+   - Распределённые блокировки (TTL) — временное резервирование мест
+   - Кэш доступности — Bitmap статусов мест для высоконагруженного чтения
+   - Репликация — мастер для записи, реплики для чтения Availability Service
 
 ### Архитектурная схема
 
 ```mermaid
-%%{init: {"themeVariables": {"fontSize": "22px"}}}%%
+%%{init: {"themeVariables": {"fontSize": "20px"}}}%%
 graph LR
-  subgraph Client
-    UserApp[Клиентское приложение]
-  end
-  
-  subgraph Gateway
-    APIGateway[API Gateway & Rate Limiter]
-  end
-  
-  subgraph Core Services
-    EventService[Event Service]
-    AvailabilityService[Availability Service]
-    BookingService[Booking Service]
-    PaymentAdapter[Payment Adapter]
-    OrderHistoryService[Order History Service]
-  end
-  
-  subgraph Caching & Queues
-    RedisCache[(Redis Cluster<br/>Distributed Locks)]
-  end
 
-  subgraph Persistence
-    PostgresDB[(PostgreSQL Cluster<br/>Events, Seats, Bookings, Orders)]
-  end
-  
-  subgraph External
-    PaymentProvider[Платёжный провайдер]
-  end
+  Client[Client]
 
-  UserApp -->|HTTP| APIGateway
-  APIGateway -->|GET /events| EventService
-  APIGateway -->|GET /events/id/seats| AvailabilityService
-  APIGateway -->|POST /bookings| BookingService
-  APIGateway -->|GET /orders| OrderHistoryService
-  
-  EventService -->|Read| PostgresDB
-  AvailabilityService -->|Read| PostgresDB
-  
-  BookingService -->|SET NX EX locks| RedisCache
-  BookingService -->|DEL locks| RedisCache
-  BookingService -->|Write| PostgresDB
-  BookingService -->|Initiate payment| PaymentProvider
-  
-  PaymentAdapter -->|Webhook| PaymentProvider
-  PaymentAdapter -->|Payment result| BookingService
-  
-  OrderHistoryService -->|Read| PostgresDB
+  CDN[CDN<br/>Search Cache]
+
+  APIGW[API Gateway<br/>Auth + Routing]
+
+  EventService[Event Service<br/>Stateless]
+
+  BookingService[Booking Service]
+
+  SearchService[Search Service]
+
+  RedisCache[(Redis Cache<br/>eventId:eventObject)]
+
+  RedisLocks[(Redis Locks<br/>ticketId:userId + TTL)]
+
+  Queue[(Virtual Waiting Queue<br/>SSE / WebSocket)]
+
+  Admitted[(Redis Set<br/>admitted:eventId)]
+
+  Elasticsearch[(Elasticsearch<br/>Full-text + Fuzzy Search<br/>Query Cache)]
+
+  Postgres[(PostgreSQL)]
+
+  Stripe[Stripe]
+
+  %% Client Flow
+  Client --> CDN
+  CDN --> APIGW
+
+  %% Search
+  APIGW -->|GET /search| SearchService
+  SearchService --> Elasticsearch
+  Postgres -. CDC .-> Elasticsearch
+
+  %% Event Read Path
+  APIGW -->|GET /events| EventService
+  EventService --> RedisCache
+  RedisCache --> Postgres
+
+  %% Queue
+  APIGW -->|Join Queue| Queue
+  Queue --> Admitted
+
+  %% Booking
+  APIGW -->|POST /bookings| BookingService
+
+  BookingService -->|Check admitted| Admitted
+
+  BookingService --> RedisLocks
+  BookingService --> Postgres
+
+  BookingService --> Stripe
+  Stripe --> BookingService
+
+  %% Notes
+  Elasticsearch:::search
+  RedisLocks:::lock
+  Queue:::queue
+  RedisCache:::cache
+
+  classDef search fill:#f3e8ff,stroke:#7c3aed,color:#000;
+  classDef lock fill:#fef3c7,stroke:#d97706,color:#000;
+  classDef queue fill:#ffe4e6,stroke:#e11d48,color:#000;
+  classDef cache fill:#dcfce7,stroke:#16a34a,color:#000;
 ```
 
 ### Паттерны и подходы
@@ -366,6 +403,15 @@ graph LR
 
 Для предотвращения двойного бронирования одного места несколькими пользователями используется паттерн **Распределённая блокировка** на основе Redis. `Booking Service` при выборе мест выполняет атомарную команду `SET key seat_id NX EX ttl`, где `key` имеет формат `seat:lock:{event_id}:{seat_id}`, а значение — `user_id`. Команда атомарна: только один клиент успешно устанавливает ключ для каждого места. TTL (например, 600 секунд) автоматически определяет срок действия блокировки. Это даёт гарантию, что два пользователя не могут одновременно забронировать одно место, и не требует постоянного опроса БД для обработки таймаутов.
 
+#### Кэширование доступности (Bitmap в Redis)
+
+Для достижения 10 000 RPS на чтение доступности мест используется паттерн **Кэширование с Bitmap**. `Availability Service` читает статусы мест напрямую из Redis Replica, где данные хранятся в виде битовой карты (1 бит = место, 1 = свободно, 0 = продано). Это позволяет:
+- Уменьшить размер данных: 50 000 мест = 6.25 KB
+- Выполнять чтение с производительностью 50 000+ операций/сек на одном узле Redis
+- Полностью разгрузить PostgreSQL от пиковых нагрузок чтения
+
+При бронировании `Booking Service` атомарно обновляет кэш через `SETBIT` и реплицирует изменения на Redis Replica, обеспечивая консистентность между чтением и записью.
+
 ---
 
 ## Технические сценарии
@@ -373,3 +419,28 @@ graph LR
 ---
 
 ## Прочие разделы на ваше усмотрение
+
+## API Методы
+
+### Мероприятия
+
+| Метод | Эндпоинт | Описание |
+|-------|----------|----------|
+| GET | `/events` | Список доступных мероприятий (с фильтрацией) |
+| GET | `/events/{event_id}` | Детальная информация о мероприятии, включая схему мест |
+
+### Бронирование
+
+| Метод | Эндпоинт | Описание |
+|-------|----------|----------|
+| POST | `/bookings` | Создать временную бронь выбранных мест |
+| POST | `/bookings/{booking_id}/deny` | Отменить бронь |
+| POST | `/bookings/{booking_id}/confirm` | Подтвердить покупку и завершить заказ |
+
+### Заказы
+
+| Метод | Эндпоинт | Описание |
+|-------|----------|----------|
+| GET | `/orders` | История заказов пользователя |
+| GET | `/orders/{order_id}` | Детальная информация о заказе |
+
