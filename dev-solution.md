@@ -16,16 +16,19 @@
 ---
 
 ## Глоссарий
-| Термин        | Определение |
-|---------------|-------------|
+| Термин | Определение |
+|--------|------------|
 | Событие | Концерт, спектакль, матч или другое мероприятие, на которое продаются билеты. |
-| Место | Конкретная позиция в зале или на площадке, доступная для бронирования. |
-| Бронь | Временное резервирование места за пользователем. |
-| Покупка | Подтверждённое оформление билета после успешной оплаты. |
-| Таймаут брони | Ограниченное время, в течение которого место удерживается за пользователем. |
-| Oversell | Cитуация, при которой одно и то же место было продано более одного раза. |
-| Idempotency | Возможность безопасно повторить запрос без создания дублей. |
-| Статус места | Текущее состояние места: свободно, забронировано, продано. |
+| Площадка (Venue) | Физическое место проведения события с определённой схемой зала и набором мест. |
+| Место | Конкретная позиция в зале, доступная для бронирования в рамках события. |
+| Статус места | Состояние места: свободно, временно забронировано (reserved), продано. |
+| Бронь (Booking) | Временное резервирование одного или нескольких мест за пользователем до оплаты. |
+| Позиция брони | Элемент брони, связанный с конкретным местом события (booking item). |
+| Заказ (Order) | Подтверждённая покупка после успешной оплаты, фиксирующая факт продажи билетов. |
+| Элемент заказа | Детализация заказа по конкретным местам, включая snapshot данных на момент покупки. |
+| Таймаут брони | Ограниченное время удержания мест за пользователем до автоматического освобождения. |
+| Virtual Waiting Queue | Механизм управления доступом пользователей к системе при пиковых нагрузках (admin-enabled режим). |
+| Oversell | Ситуация, при которой одно и то же место продаётся более одного раза. |
 
 ---
 
@@ -163,262 +166,7 @@
 1. Пользователь в истории заказов выбирает конкретный заказ.
 2. Система возвращает полную информацию о заказе.
 
-### Дополнительный сценарий: возврат оплаченных билетов
-
-1. Пользователь в истории заказов выбирает оплаченный заказ и нажимает «Вернуть билеты».
-2. Система проверяет правила мероприятия (возможен ли возврат, сроки до начала события).
-3. Если возврат разрешён, система инициирует возврат средств через платёжный шлюз и переводит места из "продано" в "свободно".
-4. Пользователь получает подтверждение о возврате и обновлённый статус заказа.
-
 ---
-
-## Модель данных (Data Model)
-
-В основе сервиса бронирования лежит управление состояниями мест и заказов. Ключевое требование — предотвращение double-booking (oversell) при высоком конкурентном доступе. Для этого используется комбинация реляционной БД (PostgreSQL) для гарантий ACID и Redis для распределённых блокировок с автоматическим TTL и кэширования доступности мест.
-
-### Основные сущности (Схема БД)
-
-```mermaid
-erDiagram
-    direction LR
-
-    USER {
-        uuid id PK
-    }
-    
-    EVENT {
-        uuid id PK
-        uuid venue_id FK
-        string name
-        timestamp event_date
-    }
-    
-    VENUE {
-        uuid id PK
-        string name
-        json address
-        json layout
-    }
-    
-    SEAT {
-        uuid id PK
-        uuid venue_id FK
-        string section
-        string row_number
-        string seat_number
-    }
-    
-    BOOKING {
-        uuid id PK
-        uuid user_id FK
-        uuid event_id FK
-        int status
-        decimal total_amount
-        timestamp created_at
-        timestamp expires_at
-    }
-    
-    EVENT_SEAT {
-        uuid id PK
-        uuid booking_id FK
-        uuid seat_id FK
-        int status
-        decimal price
-    }
-    
-    ORDER {
-        uuid id PK
-        uuid booking_id FK
-        uuid user_id FK
-        int order_status
-        decimal total_amount
-        string idempotency_key
-        timestamp created_at
-    }
-    
-    EVENT ||--o{ BOOKING : "has"
-    USER ||--o{ BOOKING : "has"
-    USER ||--o{ ORDER : "has"
-    VENUE ||--o{ SEAT : "has"
-    VENUE ||--|| EVENT : "has"
-    BOOKING ||--|{ EVENT_SEAT : "has"
-    BOOKING ||--|| ORDER : "may_complete_to"
-    SEAT ||--o{ EVENT_SEAT : "reserved_in"
-```
-
-### Описание сущностей
-
-1. **`EVENT`**: Хранит информацию о мероприятии (название, дата, время). Используется в сценариях просмотра списка мероприятий и деталей схемы зала.
-
-2. **`VENUE`**: Содержит адрес площадки и схему зала (`layout`) в формате JSON. Определяет физическую структуру мест, которые затем копируются в `SEAT` для каждого мероприятия.
-
-3. **`SEAT`**: Представляет конкретное место на конкретное мероприятие. Содержит номер, секцию, цену и статус (`free` → `sold`). Статус `reserved` не хранится в БД, так как временная блокировка вынесена в Redis. Статус изменяется при подтверждении покупки или возврате.
-
-4. **`BOOKING`**: Фиксирует временное резервирование мест за пользователем. Содержит статус (`active`, `expired`, `cancelled`, `confirmed`). Создаётся при выборе мест, завершается подтверждением покупки или отменой.
-
-5. **`BOOKING_SEAT`**: Связывает бронь с конкретными местами. Позволяет одной брони включать несколько мест.
-
-6. **`ORDER`**: Создаётся после успешного подтверждения покупки. Хранит итоговую сумму, статус заказа (`paid`, `refunded`, `failed`) и `idempotency_key` для предотвращения дублирования при повторных запросах.
-
-7. **`USER`**: Хранит идентификатор пользователя для привязки броней и заказов.
-
-### Распределённая блокировка Redis (TTL)
-
-Для предотвращения двойного бронирования одного места используется **Redis с атомарной операцией SET NX EX**.
-
-*   **Механизм блокировки**: При выборе места выполняется `SET seat:lock:{event_id}:{seat_id} user_id NX EX 600`. Ключ устанавливается только если отсутствует (NX) и автоматически истекает через 600 секунд (EX). Значение — идентификатор пользователя.
-
-*   **Снятие блокировки**: При успешной оплате `Booking Service` выполняет `DEL`. При отмене пользователем — `DEL`. При истечении TTL — Redis удаляет ключ автоматически, освобождая место без фоновых процессов.
-
-*   **Бронирование нескольких мест**: Блокировки получаются последовательно для каждого места. Если хотя бы одна не удалась — все уже полученные освобождаются (`DEL`), операция полностью отменяется.
-
-### Кэширование доступности мест (Redis Bitmap)
-
-Для достижения 10 000 RPS на чтение доступности мест используется **Redis с Bitmap**.
-
-*   **Структура хранения**: Ключ `event:availability:{event_id}` содержит Bitmap, где каждый бит соответствует одному месту. Значение `1` — свободно, `0` — продано/забронировано. Размер для 50 000 мест — 6.25 KB.
-
-*   **Стратегия чтения**: `Availability Service` при запросе схемы зала выполняет `GET` из Redis Replica. При промахе кэша — загружает статусы из PostgreSQL и записывает в Redis. Это полностью разгружает БД в пик чтения.
-
-*   **Стратегия обновления**: `Booking Service` при успешном бронировании/продаже выполняет `SETBIT` в Redis Master, меняя бит с 1 на 0. Изменения синхронно реплицируются на Redis Replica.
-
-*   **Консистентность**: Допускается асинхронная задержка между мастером и репликой (eventual consistency). В худшем случае пользователь увидит место свободным на 1-2 секунды дольше, но двойная продажа исключена блокировкой.
-
-
-### Идемпотентность (Idempotency)
-
-Для защиты от двойного списания при повторных запросах используется **уникальный ключ идемпотентности**.
-
-*   **Генерация ключа**: Клиент генерирует `idempotency_key` (UUID v4 или `user_id:request_timestamp`) и передаёт его в запросе на подтверждение покупки.
-
-*   **Уникальное ограничение**: В таблице `ORDER` создаётся уникальный индекс по полю `idempotency_key`. При попытке повторной вставки с тем же ключом БД вернёт ошибку дубликата.
-
-*   **Логика обработки**: При первом запросе создаётся заказ. При повторном — система возвращает ранее созданный заказ (без повторной оплаты и обновления статусов мест).
-
----
-
-# Архитектура системы
-
-Архитектура построена на микросервисах с использованием Redis для распределённых блокировок с TTL и кэширования доступности. Ключевые требования: выдерживать 10 000 RPS на чтение доступности и 1 000 операций бронирования в секунду в пике.
-
-### Основные компоненты
-
-1. **Load Balancer** — балансировщик нагрузки (Nginx / HAProxy / AWS ALB). Распределяет входящий трафик между экземплярами API Gateway. Обеспечивает health checks и отказоустойчивость.
-
-2. **API Gateway** — горизонтально масштабируемый компонент (3+ экземпляров). Обеспечивает аутентификацию, rate limiting (защита от DDoS) и роутинг запросов к соответствующим сервисам. Масштабируется под нагрузку за счёт добавления новых экземпляров.
-
-3. **Event Service** — сервис для работы с мероприятиями. Отдаёт список мероприятий, детальную информацию и схему зала. Работает в режиме только чтения.
-
-4. **Availability Service** — сервис доступности мест. Обрабатывает до 10 000 RPS запросов на чтение схемы зала со статусами мест. Читает данные из Redis Cache (Bitmap), не нагружая PostgreSQL.
-
-5. **Booking Service** — основной сервис для бронирования и подтверждения покупки. Управляет распределёнными блокировками в Redis, обновляет кэш доступности, создаёт брони и заказы в PostgreSQL, взаимодействует с платёжным шлюзом.
-
-6. **Payment Adapter** — интеграционный сервис для работы с внешним платёжным провайдером. Принимает вебхуки, нормализует их и передаёт в Booking Service.
-
-7. **Order History Service** — сервис истории заказов. Отдаёт пользователю список его заказов и детали.
-
-8. **PostgreSQL Cluster** — основное хранилище данных с ACID-гарантиями. Хранит события (`EVENT`), места (`SEAT`), брони (`BOOKING`) и заказы (`ORDER`).
-
-9. **Redis Cluster** — используется для трёх целей:
-   - Распределённые блокировки (TTL) — временное резервирование мест
-   - Кэш доступности — Bitmap статусов мест для высоконагруженного чтения
-   - Репликация — мастер для записи, реплики для чтения Availability Service
-
-### Архитектурная схема
-
-```mermaid
-%%{init: {"themeVariables": {"fontSize": "20px"}}}%%
-graph LR
-
-  Client[Client]
-
-  CDN[CDN<br/>Search Cache]
-
-  APIGW[API Gateway<br/>Auth + Routing]
-
-  EventService[Event Service<br/>Stateless]
-
-  BookingService[Booking Service]
-
-  SearchService[Search Service]
-
-  RedisCache[(Redis Cache<br/>eventId:eventObject)]
-
-  RedisLocks[(Redis Locks<br/>ticketId:userId + TTL)]
-
-  Queue[(Virtual Waiting Queue<br/>SSE / WebSocket)]
-
-  Admitted[(Redis Set<br/>admitted:eventId)]
-
-  Elasticsearch[(Elasticsearch<br/>Full-text + Fuzzy Search<br/>Query Cache)]
-
-  Postgres[(PostgreSQL)]
-
-  Stripe[Stripe]
-
-  %% Client Flow
-  Client --> CDN
-  CDN --> APIGW
-
-  %% Search
-  APIGW -->|GET /search| SearchService
-  SearchService --> Elasticsearch
-  Postgres -. CDC .-> Elasticsearch
-
-  %% Event Read Path
-  APIGW -->|GET /events| EventService
-  EventService --> RedisCache
-  RedisCache --> Postgres
-
-  %% Queue
-  APIGW -->|Join Queue| Queue
-  Queue --> Admitted
-
-  %% Booking
-  APIGW -->|POST /bookings| BookingService
-
-  BookingService -->|Check admitted| Admitted
-
-  BookingService --> RedisLocks
-  BookingService --> Postgres
-
-  BookingService --> Stripe
-  Stripe --> BookingService
-
-  %% Notes
-  Elasticsearch:::search
-  RedisLocks:::lock
-  Queue:::queue
-  RedisCache:::cache
-
-  classDef search fill:#f3e8ff,stroke:#7c3aed,color:#000;
-  classDef lock fill:#fef3c7,stroke:#d97706,color:#000;
-  classDef queue fill:#ffe4e6,stroke:#e11d48,color:#000;
-  classDef cache fill:#dcfce7,stroke:#16a34a,color:#000;
-```
-
-### Паттерны и подходы
-
-#### Распределённая блокировка Redis (SET NX EX)
-
-Для предотвращения двойного бронирования одного места несколькими пользователями используется паттерн **Распределённая блокировка** на основе Redis. `Booking Service` при выборе мест выполняет атомарную команду `SET key seat_id NX EX ttl`, где `key` имеет формат `seat:lock:{event_id}:{seat_id}`, а значение — `user_id`. Команда атомарна: только один клиент успешно устанавливает ключ для каждого места. TTL (например, 600 секунд) автоматически определяет срок действия блокировки. Это даёт гарантию, что два пользователя не могут одновременно забронировать одно место, и не требует постоянного опроса БД для обработки таймаутов.
-
-#### Кэширование доступности (Bitmap в Redis)
-
-Для достижения 10 000 RPS на чтение доступности мест используется паттерн **Кэширование с Bitmap**. `Availability Service` читает статусы мест напрямую из Redis Replica, где данные хранятся в виде битовой карты (1 бит = место, 1 = свободно, 0 = продано). Это позволяет:
-- Уменьшить размер данных: 50 000 мест = 6.25 KB
-- Выполнять чтение с производительностью 50 000+ операций/сек на одном узле Redis
-- Полностью разгрузить PostgreSQL от пиковых нагрузок чтения
-
-При бронировании `Booking Service` атомарно обновляет кэш через `SETBIT` и реплицирует изменения на Redis Replica, обеспечивая консистентность между чтением и записью.
-
----
-
-## Технические сценарии
-
----
-
-## Прочие разделы на ваше усмотрение
 
 ## API Методы
 
@@ -444,3 +192,650 @@ graph LR
 | GET | `/orders` | История заказов пользователя |
 | GET | `/orders/{order_id}` | Детальная информация о заказе |
 
+---
+
+## Модель данных (Data Model)
+
+В основе сервиса бронирования лежит управление состояниями мест и заказов. Ключевое требование — предотвращение double-booking (oversell) при высоком конкурентном доступе. Для этого используется комбинация реляционной БД (PostgreSQL) для гарантий ACID и Redis для распределённых блокировок с автоматическим TTL и кэширования доступности мест.
+
+### Основные сущности (Схема БД)
+
+```mermaid
+erDiagram
+    direction LR
+
+    USER {
+        uuid id PK
+    }
+
+    VENUE {
+        uuid id PK
+        string name
+        json address
+        json layout
+    }
+
+    VENUE_SEAT {
+        uuid id PK
+        uuid venue_id FK
+        string section
+        string row_number
+        string seat_number
+    }
+
+    EVENT {
+        uuid id PK
+        uuid venue_id FK
+        string name
+        timestamp event_date
+    }
+
+    EVENT_SEAT {
+        uuid id PK
+        uuid event_id FK
+        uuid venue_seat_id FK
+        uuid booking_id FK
+        uuid order_id FK
+        int status
+        decimal price
+    }
+
+    BOOKING {
+        uuid id PK
+        uuid user_id FK
+        int status
+        timestamp created_at
+        timestamp expires_at
+    }
+
+    BOOKING_ITEM {
+        uuid id PK
+        uuid booking_id FK
+        uuid event_seat_id FK
+        decimal price
+    }
+
+    ORDER {
+        uuid id PK
+        uuid user_id FK
+        uuid booking_id FK
+        uuid event_id FK
+        int status
+        decimal total_amount
+        timestamp created_at
+    }
+
+    ORDER_ITEM {
+        uuid id PK
+        uuid order_id FK
+        uuid event_seat_id FK
+        string section
+        string row_number
+        string seat_number
+        decimal price
+    }
+
+    USER ||--o{ BOOKING : creates
+    USER ||--o{ ORDER : purchases
+
+    VENUE ||--o{ VENUE_SEAT : contains
+    VENUE ||--o{ EVENT : hosts
+
+    EVENT ||--o{ EVENT_SEAT : includes
+    VENUE_SEAT ||--o{ EVENT_SEAT : mapped_to
+
+    BOOKING ||--o{ BOOKING_ITEM : contains
+    EVENT_SEAT ||--o{ BOOKING_ITEM : reserved_as
+
+    ORDER ||--o{ ORDER_ITEM : contains
+    EVENT_SEAT ||--o{ ORDER_ITEM : sold_as
+
+    BOOKING ||--o{ EVENT_SEAT : temporarily_reserves
+    ORDER ||--o{ EVENT_SEAT : permanently_sells
+```
+
+### Описание сущностей
+
+1. **`EVENT`**: Хранит информацию о мероприятии (название, дата и время проведения, площадка). Используется в сценариях просмотра каталога мероприятий, получения информации о событии и отображения схемы мест.
+
+2. **`VENUE`**: Содержит информацию о площадке проведения мероприятия (название, адрес). Определяет физическую структуру зала, в рамках которой создаются места (`VENUE_SEAT`).
+
+3. **`VENUE_SEAT`**: Представляет физическое место на площадке. Содержит сектор, ряд и номер места. Используется как шаблон для создания мест конкретного мероприятия (`EVENT_SEAT`).
+
+4. **`EVENT_SEAT`**: Представляет конкретное место на конкретном мероприятии. Является основной сущностью для контроля доступности мест. Содержит статус (`free`, `sold`), цену, ссылки на бронь и заказ.
+
+5. **`BOOKING`**: Фиксирует временное резервирование мест за пользователем. Содержит статус (`active`, `expired`, `cancelled`, `confirmed`), время создания и время истечения брони. Создаётся при выборе мест и завершается подтверждением покупки либо отменой.
+
+6. **`BOOKING_ITEM`**: Связывает бронь с конкретными местами мероприятия (`EVENT_SEAT`). Позволяет одной брони содержать несколько мест. Хранит цену на момент резервирования.
+
+7. **`ORDER`**: Создаётся после успешного подтверждения покупки. Представляет подтверждённый заказ пользователя и используется для хранения истории покупок. Содержит итоговую сумму, статус заказа и время оформления.
+
+8. **`ORDER_ITEM`**: Связывает заказ с конкретными купленными местами. Хранит snapshot данных места (сектор, ряд, номер, цена) на момент покупки.
+
+9. **`USER`**: Хранит идентификатор пользователя системы. Используется для привязки броней, заказов и получения истории покупок пользователя.
+
+---
+
+# Архитектура системы
+
+Архитектура построена на микросервисной модели с использованием Redis для кэширования, распределённых блокировок и управления доступом в периоды высокой нагрузки. Основной фокус системы — поддержка 10 000 RPS на чтение доступности мест и до 1 000 операций бронирования в секунду при пиковых нагрузках.
+
+## Основные компоненты
+
+1. **Load Balancer** — входная точка системы, распределяет трафик между API Gateway инстансами, обеспечивает отказоустойчивость и базовую защиту от перегрузок.
+
+2. **API Gateway** — единая точка входа для клиентов, отвечает за аутентификацию, rate limiting и маршрутизацию запросов к внутренним сервисам. Также участвует в проверке доступа пользователей при использовании Virtual Waiting Queue.
+
+3. **Event Service** — сервис чтения данных о мероприятиях, возвращает информацию о событиях, venue и схеме зала. Использует Redis Cache для ускорения ответов и PostgreSQL как основной источник истины.
+
+4. **Availability Service** — высоконагруженный read-сервис, отвечающий за отображение доступности мест и формирование схемы зала. Объединяет данные из PostgreSQL и Redis (включая временные блокировки).
+
+5. **Search Service** — сервис поиска мероприятий, использующий PostgreSQL Full-Text Search на основе GIN индексов и tsvector.
+
+6. **Booking Service** — основной сервис бронирования, отвечающий за управление временными резервированиями через Redis (SET NX EX), создание бронирований, транзакционные операции в PostgreSQL и финализацию заказов.
+
+7. **Payment Adapter** — интеграционный слой для работы с платёжным провайдером (например, Stripe), обрабатывает вебхуки и передаёт события в Booking Service для завершения транзакций.
+
+8. **Order History Service** — сервис для получения истории заказов пользователя, построенный по CQRS-подходу и работающий поверх PostgreSQL read-модели.
+
+9. **PostgreSQL Cluster** — основное хранилище системы (source of truth), обеспечивает ACID-гарантии и предотвращение oversell через транзакции и механизмы блокировок.
+
+10. **Redis Cluster** — используется для распределённых блокировок (seat reservations), кэширования часто запрашиваемых данных и хранения состояния виртуальной очереди (admitted users).
+
+## Архитектурная схема
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "22px"}}}%%
+graph LR
+
+  subgraph Client
+    ClientApp[Client Application]
+  end
+
+  subgraph Edge_Layer
+    LB[Load Balancer]
+    APIGW[API Gateway]
+  end
+
+  subgraph Core_Services
+    EventService[Event Service]
+    AvailabilityService[Availability Service]
+    SearchService[Search Service]
+    BookingService[Booking Service]
+    PaymentAdapter[Payment Adapter]
+    OrderService[Order History Service]
+  end
+
+  subgraph Caching_Coordination
+    RedisCache[(Redis Cache)]
+    RedisLocks[(Redis Locks)]
+    Admitted[(Redis Set admitted:eventId)]
+    Queue[Virtual Waiting Queue]
+  end
+
+  subgraph Persistence
+    Postgres[(PostgreSQL Cluster)]
+  end
+
+  subgraph External
+    Stripe[Stripe]
+  end
+
+  %% Entry flow
+  ClientApp -->|HTTPS request| LB
+  LB -->|route request| APIGW
+
+  %% Event flow
+  APIGW -->|GET /events/:id| EventService
+  EventService -->|cache lookup| RedisCache
+  RedisCache -->|cache miss DB read| Postgres
+
+  %% Availability flow
+  APIGW -->|GET /availability| AvailabilityService
+  AvailabilityService -->|read bitmap| RedisCache
+  AvailabilityService -->|check locks| RedisLocks
+  AvailabilityService -->|fallback read| Postgres
+
+  %% Search flow (GIN / FTS)
+  APIGW -->|GET /search| SearchService
+  SearchService -->|Postgres full-text + GIN| Postgres
+
+  %% Booking flow
+  APIGW -->|POST /bookings| BookingService
+  BookingService -->|check admitted| Admitted
+  BookingService -->|Redis lock SET NX EX| RedisLocks
+  BookingService -->|transaction write| Postgres
+  BookingService -->|init payment| Stripe
+
+  %% Payment flow
+  Stripe -->|webhook payment event| PaymentAdapter
+  PaymentAdapter -->|normalized event| BookingService
+
+  %% Queue flow
+  APIGW -->|join queue| Queue
+  Queue -->|grant access| Admitted
+
+  %% Orders
+  APIGW -->|GET /orders| OrderService
+  OrderService -->|read model| Postgres
+```
+
+### Паттерны и подходы
+
+#### Распределённая блокировка Redis (SET NX EX)
+
+Для временного резервирования мест и уменьшения конкурентных конфликтов используется паттерн **распределённой блокировки** на основе Redis. `Booking Service` при выборе мест выполняет атомарную команду `SET seat:lock:{event_id}:{seat_id} user_id NX EX ttl`, где `NX` позволяет установить ключ только при его отсутствии, а `EX` задаёт TTL блокировки (например, 600 секунд). Это гарантирует, что только один пользователь может временно зарезервировать место в каждый момент времени. Redis используется как механизм краткоживущих блокировок и автоматического освобождения мест по таймауту, тогда как PostgreSQL остаётся основным источником истины и гарантирует отсутствие oversell через транзакции и механизмы блокировок.
+
+#### Кэширование
+
+Для снижения нагрузки на базу данных и ускорения ответа API используется **кэширование часто запрашиваемых и редко изменяемых данных**. В Redis помещаются данные о мероприятиях, площадках и схемах залов. При запросе сначала выполняется чтение из кэша, и только при cache miss происходит обращение к PostgreSQL с последующим обновлением кэша. Для поддержания актуальности используются TTL и/или механизмы инвалидации при изменении данных в базе. Это позволяет существенно снизить нагрузку на БД и уменьшить latency для read-heavy сценариев.
+
+#### Load Balancing
+
+Для равномерного распределения входящего трафика используется **балансировка нагрузки**. Все клиентские запросы проходят через load balancer, который распределяет их между экземплярами API Gateway и микросервисов с использованием алгоритма Round Robin. Это позволяет избежать перегрузки отдельных инстансов, повысить устойчивость системы и обеспечить стабильную работу при пиковых нагрузках, особенно во время старта продаж популярных мероприятий.
+
+#### Horizontal Scaling
+
+Для обработки высокой нагрузки сервисы проектируются как **stateless компоненты**, что позволяет масштабировать их горизонтально путём добавления новых экземпляров. API Gateway, Event Service и Search Service могут быть увеличены по количеству инстансов в зависимости от текущей нагрузки. Балансировщик равномерно распределяет трафик между ними. Это обеспечивает возможность системы выдерживать резкие всплески трафика, характерные для популярных событий.
+
+#### Virtual Waiting Queue (Admin-enabled)
+
+Для обеспечения стабильной работы системы при экстремально высокой нагрузке используется **виртуальная очередь ожидания**, которая включается только для отдельных высоконагруженных мероприятий (admin-enabled режим). Перед доступом к странице бронирования пользователи помещаются в очередь, где управляется их порядок доступа к seat map и Booking Service. Очередь реализуется с использованием Redis (например, sorted set с timestamp), а клиент получает обновления через SSE или WebSocket в реальном времени.
+
+После продвижения пользователя из очереди его sessionId добавляется в allowlist (`admitted:{eventId}`) с TTL, и только такие пользователи могут инициировать операции бронирования. Booking Service проверяет наличие пользователя в этом списке перед обработкой запросов. Это позволяет контролировать поток пользователей в систему, предотвращать перегрузку и обеспечивать более стабильный пользовательский опыт во время пиковых продаж.
+
+#### Full-Text Search в PostgreSQL (GIN Index + tsvector)
+
+Для улучшения производительности поиска по событиям в рамках SQL-базы используется встроенный механизм **full-text search в PostgreSQL** на основе `tsvector` и индекса типа **GIN (Generalized Inverted Index)**. Вместо медленного `LIKE '%query%'` применяется преобразование текстовых полей (name, description и др.) в `tsvector`, по которому выполняется индексированный поиск через `tsquery`.
+
+Для ускорения запросов создаётся GIN индекс по полю `tsvector`, что позволяет эффективно выполнять поиск по ключевым словам без полного сканирования таблицы. Это значительно снижает latency по сравнению с `LIKE` и хорошо подходит для умеренных объёмов данных и базового уровня search-функциональности. 
+
+Данный подход не требует отдельной поисковой инфраструктуры и обеспечивает компромисс между производительностью и сложностью системы, однако менее гибок по сравнению с специализированными search engines (например, Elasticsearch) и требует аккуратной настройки индексов и обновления tsvector при изменении данных.
+
+---
+
+## Технические сценарии
+
+### Сценарий: Поиск и просмотр списка мероприятий (PostgreSQL GIN)
+1. Клиент отправляет запрос поиска мероприятий через API Gateway (GET /search?query=...).
+2. API Gateway перенаправляет запрос в Search Service.
+3. Search Service формирует full-text запрос PostgreSQL (tsquery) на основе пользовательского input.
+4. Поиск выполняется по предварительно подготовленному tsvector полю (name, description и другие текстовые поля).
+5. PostgreSQL использует GIN index, чтобы избежать full table scan и быстро найти релевантные события.
+6. Результаты возвращаются в Search Service без необходимости внешних поисковых систем (например, Elasticsearch).
+7. Search Service возвращает список событий клиенту.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant LB as Load Balancer
+  participant APIGW as API Gateway
+  participant SearchService
+  participant Postgres
+
+  Client->>LB: GET /search?query=music festival
+  LB->>APIGW: Route request
+
+  APIGW->>SearchService: Search events
+
+  SearchService->>Postgres: FTS query using tsquery on tsvector
+
+  Note over Postgres: Uses GIN index for fast lookup
+
+  Postgres-->>SearchService: Matching events
+
+  SearchService-->>APIGW: Results
+  APIGW-->>Client: 200 OK (events[])
+```
+
+### Сценарий: Просмотр деталей мероприятия и схемы зала
+1. Клиент запрашивает детали мероприятия через API Gateway (GET /events/:eventId).
+2. API Gateway проверяет, не включён ли Virtual Waiting Queue для данного события (admin-enabled режим).
+3. Если очередь активна, пользователь должен быть предварительно допущен (admitted list в Redis).
+4. Запрос передаётся в Event Service.
+5. Event Service сначала выполняет чтение из Redis Cache (event details + venue + layout).
+6. При cache miss данные загружаются из PostgreSQL и сохраняются в Redis.
+7. Параллельно Availability Service предоставляет актуальный статус мест (bitmap + locks).
+8. Клиент получает объединённый ответ: event + venue + seat availability.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant LB as Load Balancer
+  participant APIGW as API Gateway
+  participant Queue as Virtual Waiting Queue
+  participant Admitted as Redis (Admitted Set)
+  participant EventService
+  participant AvailabilityService
+  participant RedisCache
+  participant RedisLocks
+  participant Postgres
+
+  Client->>LB: GET /events/{eventId}
+  LB->>APIGW: Route request
+
+  alt Queue enabled for event
+    APIGW->>Admitted: Check session access
+
+    alt Not admitted
+      APIGW-->>Client: 403 / Redirect to Queue
+    else Admitted
+      APIGW->>EventService: Fetch event details
+    end
+
+  else Queue disabled
+    APIGW->>EventService: Fetch event details
+  end
+
+  EventService->>RedisCache: GET event:{eventId}
+
+  alt Cache Hit
+    RedisCache-->>EventService: Event data
+  else Cache Miss
+    EventService->>Postgres: Read event + venue + layout
+    Postgres-->>EventService: Data
+    EventService->>RedisCache: SET event:{eventId} (TTL)
+  end
+
+  EventService-->>APIGW: Event + venue
+
+  APIGW->>AvailabilityService: Get seat availability
+  AvailabilityService->>RedisCache: GET bitmap:{eventId}
+  AvailabilityService->>RedisLocks: GET active locks
+
+  AvailabilityService-->>APIGW: Seat map status
+  APIGW-->>Client: 200 OK (event + seat map)
+```
+
+### Сценарий: выбор свободных мест для бронирования
+
+1. Пользователь выбирает места на seat map и отправляет запрос `POST /bookings/select-seats`.
+2. Запрос проходит через Load Balancer и API Gateway и направляется в `Booking Service`.
+3. `Booking Service` пытается атомарно установить Redis-блокировки (`SET NX EX`) для каждого выбранного места.
+4. Если все блокировки успешно установлены, создаётся запись `BOOKING` со статусом `IN_PROGRESS`, а выбранные места сохраняются в `BOOKING_SEAT`.
+5. Пользователь получает `bookingId` и время жизни резервирования (TTL), в течение которого должен завершить оплату.
+6. Если хотя бы одно место уже заблокировано другим пользователем, сервис возвращает ошибку `409 Conflict`, а успешно захваченные блокировки освобождаются.
+7. Если пользователь не завершает оплату вовремя, Redis автоматически удаляет блокировки по TTL, и места снова становятся доступными для бронирования.
+8. Финальная защита от oversell обеспечивается PostgreSQL через транзакции и механизмы блокировок при подтверждении покупки.
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "22px"}}}%%
+sequenceDiagram
+
+  participant Client
+  participant LB as Load Balancer
+  participant APIGW as API Gateway
+  participant Booking as Booking Service
+  participant RedisLocks as Redis Locks
+  participant Postgres as PostgreSQL
+
+  Client->>LB: POST /bookings/select-seats
+  LB->>APIGW: Route request
+  APIGW->>Booking: Reserve selected seats
+
+  loop For each selected seat
+    Booking->>RedisLocks: SET seat:lock:{eventId}:{seatId} userId NX EX 600
+  end
+
+  alt All locks acquired
+    RedisLocks-->>Booking: OK
+
+    Booking->>Postgres: INSERT booking (status=IN_PROGRESS)
+    Booking->>Postgres: INSERT booking_seats
+
+    Postgres-->>Booking: Booking created
+
+    Booking-->>APIGW: bookingId + reservation TTL
+    APIGW-->>Client: 200 OK (Seats Reserved)
+
+    Note over RedisLocks: Locks automatically expire after TTL
+
+  else Some seat already locked
+    RedisLocks-->>Booking: LOCK_FAILED
+
+    Booking-->>APIGW: Seat unavailable
+    APIGW-->>Client: 409 Conflict
+  end
+```
+
+### Сценарий: Подтверждение покупки
+
+1. После успешного резервирования мест пользователь отправляет запрос `POST /bookings/{bookingId}/confirm`.
+2. Запрос проходит через Load Balancer и API Gateway и направляется в `Booking Service`.
+3. `Booking Service` проверяет существование активного бронирования (`BOOKING.status = IN_PROGRESS`) и валидность Redis-блокировок для всех мест.
+4. Сервис инициирует оплату через Stripe и создаёт `PaymentIntent`.
+5. Пользователь завершает оплату на стороне Stripe.
+6. После успешной оплаты Stripe отправляет webhook в `Payment Adapter`.
+7. `Payment Adapter` нормализует webhook и передаёт событие в `Booking Service`.
+8. `Booking Service` открывает транзакцию в PostgreSQL и повторно проверяет статус мест.
+9. В рамках транзакции:
+   - `BOOKING.status` обновляется на `CONFIRMED`
+   - создаётся запись `ORDER`
+   - места в `BOOKING_SEAT` переводятся в состояние `SOLD`
+10. После успешного commit Redis-блокировки удаляются вручную, чтобы освободить ресурсы раньше TTL.
+11. Пользователь получает подтверждение покупки и может увидеть заказ через `Order History Service`.
+12. Если во время подтверждения возникает конфликт или блокировки истекли, транзакция откатывается, а платёж компенсируется через refund.
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "22px"}}}%%
+sequenceDiagram
+
+  participant Client
+  participant LB as Load Balancer
+  participant APIGW as API Gateway
+  participant Booking as Booking Service
+  participant RedisLocks as Redis Locks
+  participant Stripe
+  participant Adapter as Payment Adapter
+  participant Postgres as PostgreSQL
+
+  Client->>LB: POST /bookings/{bookingId}/confirm
+  LB->>APIGW: Route request
+  APIGW->>Booking: Confirm booking
+
+  Booking->>Postgres: Validate BOOKING (IN_PROGRESS)
+  Booking->>RedisLocks: Check seat locks ownership
+
+  alt Locks valid
+    RedisLocks-->>Booking: Locks OK
+
+    Booking->>Stripe: Create PaymentIntent
+    Stripe-->>Client: Checkout / Payment Form
+
+    Note over Client, Stripe: User completes payment
+
+    Stripe->>Adapter: payment_succeeded webhook
+    Adapter->>Booking: Normalized payment event
+
+    Booking->>Postgres: BEGIN TRANSACTION
+    Booking->>Postgres: UPDATE BOOKING status=CONFIRMED
+    Booking->>Postgres: INSERT ORDER
+    Booking->>Postgres: UPDATE BOOKING_SEAT status=SOLD
+    Postgres-->>Booking: COMMIT
+
+    Booking->>RedisLocks: DEL seat locks
+
+    Booking-->>APIGW: Purchase confirmed
+    APIGW-->>Client: 200 OK (order confirmed)
+
+  else Lock expired / invalid
+    RedisLocks-->>Booking: LOCK_INVALID
+
+    Booking->>Stripe: Refund payment (if needed)
+
+    Booking-->>APIGW: Booking failed
+    APIGW-->>Client: 409 Conflict
+  end
+```
+
+### Сценарий: отмена брони пользователем до оплаты
+
+1. Пользователь отправляет запрос `DELETE /bookings/{bookingId}` или `POST /bookings/{bookingId}/cancel`.
+2. Запрос проходит через Load Balancer и API Gateway и направляется в `Booking Service`.
+3. `Booking Service` проверяет существование бронирования и его статус (`IN_PROGRESS`).
+4. Сервис валидирует, что отмена выполняется владельцем бронирования и что оплата ещё не была подтверждена.
+5. В PostgreSQL открывается транзакция:
+   - `BOOKING.status` обновляется на `CANCELLED`
+   - связанные записи `BOOKING_SEAT` переводятся в состояние `FREE`
+6. После успешного commit сервис вручную удаляет Redis-блокировки (`DEL seat:lock:{eventId}:{seatId}`), не дожидаясь TTL.
+7. Освобождённые места снова становятся доступны для других пользователей.
+8. Пользователь получает подтверждение успешной отмены бронирования.
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "22px"}}}%%
+sequenceDiagram
+
+  participant Client
+  participant LB as Load Balancer
+  participant APIGW as API Gateway
+  participant Booking as Booking Service
+  participant RedisLocks as Redis Locks
+  participant Postgres as PostgreSQL
+
+  Client->>LB: DELETE /bookings/{bookingId}
+  LB->>APIGW: Route request
+  APIGW->>Booking: Cancel booking
+
+  Booking->>Postgres: Validate BOOKING status=IN_PROGRESS
+
+  alt Booking active
+    Booking->>Postgres: BEGIN TRANSACTION
+    Booking->>Postgres: UPDATE BOOKING status=CANCELLED
+    Booking->>Postgres: UPDATE BOOKING_SEAT status=FREE
+    Postgres-->>Booking: COMMIT
+
+    Booking->>RedisLocks: DEL seat locks
+
+    Booking-->>APIGW: Booking cancelled
+    APIGW-->>Client: 200 OK
+
+  else Booking already confirmed / expired
+    Booking-->>APIGW: Cancellation rejected
+    APIGW-->>Client: 409 Conflict
+  end
+```
+
+### Сценарий: автоматическое снятие брони по таймауту
+
+1. После выбора мест `Booking Service` создаёт Redis-блокировки (`SET NX EX`) с TTL, например 10 минут.
+2. Одновременно в PostgreSQL создаётся запись `BOOKING` со статусом `IN_PROGRESS`.
+3. Если пользователь не завершает оплату до истечения TTL, Redis автоматически удаляет блокировки мест.
+4. После исчезновения Redis lock места перестают считаться временно зарезервированными и снова отображаются как доступные через `Availability Service`.
+5. Фоновый процесс (`Booking Cleanup Job`) периодически сканирует PostgreSQL на наличие просроченных бронирований со статусом `IN_PROGRESS`.
+6. Для всех истёкших бронирований сервис обновляет статус `BOOKING` на `EXPIRED`.
+7. Связанные записи `BOOKING_SEAT` переводятся обратно в состояние `FREE`.
+8. После завершения cleanup места полностью возвращаются в пул доступных для покупки.
+
+```mermaid
+%%{init: {"themeVariables": {"fontSize": "22px"}}}%%
+sequenceDiagram
+
+  participant Client
+  participant Booking as Booking Service
+  participant RedisLocks as Redis Locks
+  participant Availability as Availability Service
+  participant Cleanup as Booking Cleanup Job
+  participant Postgres as PostgreSQL
+
+  Client->>Booking: Select seats
+  Booking->>RedisLocks: SET seat lock NX EX 600
+  Booking->>Postgres: INSERT BOOKING (IN_PROGRESS)
+
+  Note over RedisLocks: TTL countdown starts
+
+  alt User does not complete payment
+    RedisLocks-->>RedisLocks: Auto expire locks
+
+    Availability->>RedisLocks: Check active locks
+    RedisLocks-->>Availability: Lock not found
+
+    Availability-->>Client: Seats visible as FREE
+
+    Cleanup->>Postgres: Find expired IN_PROGRESS bookings
+    Cleanup->>Postgres: UPDATE BOOKING status=EXPIRED
+    Cleanup->>Postgres: UPDATE BOOKING_SEAT status=FREE
+
+    Postgres-->>Cleanup: Cleanup completed
+  end
+```
+
+### Сценарий: просмотр истории заказов пользователя
+
+1. Пользователь отправляет запрос `GET /orders?limit=20&cursor=...` для получения своей истории заказов.
+2. Запрос проходит через `Load Balancer` и `API Gateway`.
+3. `API Gateway` выполняет аутентификацию пользователя и маршрутизирует запрос в `Order History Service`.
+4. `Order History Service` выполняет запрос к PostgreSQL read-модели (`ORDER`, `BOOKING`, `EVENT`) с использованием cursor-based пагинации.
+5. PostgreSQL возвращает список заказов пользователя.
+6. `Order History Service` формирует DTO-ответ и возвращает его клиенту.
+7. Клиент сохраняет полученные данные локально (например, in-memory cache / browser storage) с коротким TTL.
+8. При повторном открытии страницы клиент сначала отображает локально сохранённые данные и параллельно может выполнять background refresh для актуализации информации.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant LB as Load Balancer
+  participant APIGW as API Gateway
+  participant OrderService as Order History Service
+  participant Postgres as PostgreSQL
+
+  Client->>Client: Check local cache
+
+  alt Local Cache Hit
+    Client-->>Client: Show cached orders
+    Client->>LB: Background refresh request
+  else Cache Miss
+    Client->>LB: GET /orders?limit=20&cursor=...
+  end
+
+  LB->>APIGW: Route request
+  APIGW->>OrderService: Get user orders
+
+  OrderService->>Postgres: SELECT user orders (cursor pagination)
+  Postgres-->>OrderService: Orders list
+
+  OrderService-->>APIGW: Orders response
+  APIGW-->>Client: 200 OK (orders)
+
+  Client->>Client: Update local cache
+```
+
+### Сценарий: просмотр деталей конкретного заказа
+
+1. Пользователь открывает страницу заказа (`GET /orders/{orderId}`).
+2. Клиент сначала проверяет наличие деталей заказа в локальном кэше.
+3. При наличии данных (`cache hit`) клиент сразу отображает сохранённую информацию и параллельно может выполнять background refresh.
+4. При отсутствии данных (`cache miss`) запрос отправляется через `Load Balancer` и `API Gateway`.
+5. `API Gateway` выполняет аутентификацию пользователя и маршрутизирует запрос в `Order History Service`.
+6. `Order History Service` выполняет запрос к PostgreSQL read-модели (`ORDER`, `BOOKING`, `EVENT`, `SEAT`).
+7. PostgreSQL возвращает детали заказа, включая статус оплаты, информацию о мероприятии и список мест.
+8. `Order History Service` формирует DTO-ответ и возвращает его клиенту.
+9. Клиент сохраняет результат в локальном кэше с коротким TTL для ускорения последующих просмотров.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant LB as Load Balancer
+  participant APIGW as API Gateway
+  participant OrderService as Order History Service
+  participant Postgres as PostgreSQL
+
+  Client->>Client: Check local cache (order details)
+
+  alt Local Cache Hit
+    Client-->>Client: Show cached order details
+    Client->>LB: Background refresh request
+  else Cache Miss
+    Client->>LB: GET /orders/{orderId}
+  end
+
+  LB->>APIGW: Route request
+  APIGW->>OrderService: Get order details
+
+  OrderService->>Postgres: SELECT order + booking + seats + event
+  Postgres-->>OrderService: Order details
+
+  OrderService-->>APIGW: Order DTO response
+  APIGW-->>Client: 200 OK (order details)
+
+  Client->>Client: Update local cache
+```
